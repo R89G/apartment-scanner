@@ -1,10 +1,8 @@
 import asyncio
-import json
 import logging
 import os
 import random
 import sys
-from datetime import date
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -26,7 +24,6 @@ except ImportError:
 
 BASE_DIR = Path(__file__).parent
 LOG_PATH = BASE_DIR / "logs" / "checker.log"
-INCONCLUSIVE_FILE = BASE_DIR / "data" / "yad2_inconclusive.json"
 
 SCOPES = [
     "https://spreadsheets.google.com/feeds",
@@ -82,35 +79,6 @@ def setup_logging() -> None:
     console = logging.StreamHandler(sys.stdout)
     console.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
     logging.basicConfig(level=logging.INFO, handlers=[handler, console])
-
-
-# ---------------------------------------------------------------------------
-# Inconclusive tracker — persisted in data/yad2_inconclusive.json
-# Format: { "token": {"count": N, "first_seen": "YYYY-MM-DD"} }
-# A token is deleted from the sheet after being inconclusive on 2 separate
-# calendar days.  This handles expired listings whose data Yad2 still keeps
-# in its DB (so the GW item API returns 302 instead of 404).
-# ---------------------------------------------------------------------------
-
-def _load_inconclusive() -> dict:
-    if INCONCLUSIVE_FILE.exists():
-        try:
-            return json.loads(INCONCLUSIVE_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {}
-
-
-def _save_inconclusive(data: dict) -> None:
-    INCONCLUSIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    INCONCLUSIVE_FILE.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-
-
-def _inconclusive_is_stale(entry: dict, today: str) -> bool:
-    """Return True if this token has been inconclusive on a previous calendar day."""
-    return entry.get("first_seen", today) < today
 
 
 # ---------------------------------------------------------------------------
@@ -330,14 +298,11 @@ async def main() -> None:
     data_rows = all_values[1:]
     logger.info("Checking %d listings...", len(data_rows))
 
-    today = date.today().isoformat()
-    inconclusive = _load_inconclusive()
-
     # Try to build Yad2 map inventory (works when PerimeterX doesn't block)
     yad2_active_tokens = await _fetch_yad2_active_tokens()
 
     rows_to_delete: list[int] = []
-    tokens_still_inconclusive: set[str] = set()
+    inconclusive_count = 0
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
@@ -364,59 +329,33 @@ async def main() -> None:
 
                 if gw_result is True:
                     inactive = True
-                    inconclusive.pop(token, None)  # clear tracking
 
                 elif gw_result is False:
                     inactive = False
-                    inconclusive.pop(token, None)  # confirmed active
 
                 else:
-                    # GW returned 302 (PerimeterX) — inconclusive
+                    # GW returned 302 (PerimeterX blocked) — inconclusive
 
-                    # Step 2: Map inventory (if available this run)
+                    # Step 2: Map inventory (when the map API isn't blocked)
                     if yad2_active_tokens:
                         in_map = token in yad2_active_tokens
                         if in_map:
                             logger.info("Yad2 map: token found → active: %s", url)
                             inactive = False
-                            inconclusive.pop(token, None)
                         else:
-                            logger.info("Yad2 map: token absent → inactive: %s", url)
+                            logger.info("Yad2 map: token absent from search results → inactive: %s", url)
                             inactive = True
-                            inconclusive.pop(token, None)
 
                     else:
-                        # Step 3: Inconclusive tracker
-                        entry = inconclusive.get(token)
-                        if entry and _inconclusive_is_stale(entry, today):
-                            # Seen as inconclusive on a previous day → expired
+                        # Step 3: Playwright last resort
+                        inactive = await _check_yad2_playwright(page, url)
+                        if not inactive:
+                            # Both GW and map blocked — genuinely can't determine
+                            inconclusive_count += 1
                             logger.info(
-                                "Yad2 token %s inconclusive since %s (stale) → inactive: %s",
-                                token, entry["first_seen"], url,
+                                "Yad2 token %s: all checks inconclusive (PerimeterX) — keeping: %s",
+                                token, url,
                             )
-                            inactive = True
-                            inconclusive.pop(token, None)
-                        else:
-                            # Step 4: Playwright last resort
-                            inactive = await _check_yad2_playwright(page, url)
-                            if inactive:
-                                inconclusive.pop(token, None)
-                            else:
-                                # Still inconclusive — record for next run
-                                if token not in inconclusive:
-                                    inconclusive[token] = {"count": 1, "first_seen": today}
-                                    logger.info(
-                                        "Yad2 token %s marked inconclusive (first time, date=%s) — keeping: %s",
-                                        token, today, url,
-                                    )
-                                else:
-                                    inconclusive[token]["count"] += 1
-                                    logger.info(
-                                        "Yad2 token %s still inconclusive (count=%d, first=%s) — keeping: %s",
-                                        token, inconclusive[token]["count"],
-                                        inconclusive[token]["first_seen"], url,
-                                    )
-                                tokens_still_inconclusive.add(token)
             else:
                 inactive = await _check_browser(page, url)
 
@@ -431,18 +370,6 @@ async def main() -> None:
         await context.close()
         await browser.close()
 
-    # Remove inconclusive entries for tokens no longer in the sheet
-    sheet_tokens = set()
-    for row in data_rows:
-        url = row[url_col_idx] if url_col_idx < len(row) else ""
-        if "yad2.co.il" in url:
-            sheet_tokens.add(url.rstrip("/").rsplit("/", 1)[-1])
-    for token in list(inconclusive.keys()):
-        if token not in sheet_tokens:
-            inconclusive.pop(token, None)
-
-    _save_inconclusive(inconclusive)
-
     if rows_to_delete:
         logger.info("Deleting %d inactive rows from sheet...", len(rows_to_delete))
         delete_rows_batch(ws, rows_to_delete)
@@ -450,11 +377,12 @@ async def main() -> None:
     else:
         logger.info("All %d listings are still active. Nothing deleted.", len(data_rows))
 
-    if tokens_still_inconclusive:
+    if inconclusive_count:
         logger.info(
-            "%d Yad2 tokens remain inconclusive (PerimeterX blocked all checks). "
-            "They will be deleted on the next run if still inconclusive: %s",
-            len(tokens_still_inconclusive), tokens_still_inconclusive,
+            "%d Yad2 listing(s) could not be verified (PerimeterX blocked GW API and map API). "
+            "They are kept in the sheet until Yad2 purges them (returns 404) "
+            "or until the map API is accessible again.",
+            inconclusive_count,
         )
 
     logger.info("=== Checker complete ===")
