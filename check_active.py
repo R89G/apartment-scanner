@@ -3,7 +3,6 @@ import logging
 import os
 import random
 import sys
-import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -12,6 +11,8 @@ import gspread
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from playwright.async_api import async_playwright
+
+from scrapers.yad2 import TEL_AVIV_BOXES, YAD2_MAP_URL
 
 try:
     from playwright_stealth import Stealth as _StealthCls
@@ -30,7 +31,6 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-# Text patterns that mean the listing is gone (checked against page body text)
 INACTIVE_PATTERNS = [
     "חיפשנו בכל מקום",
     "אין לנו עמוד כזה",
@@ -45,13 +45,13 @@ INACTIVE_PATTERNS = [
     "listing removed",
 ]
 
-# GW API headers — same style as yad2.py map API (these bypass PerimeterX)
 _MOBILE_UAS = [
     "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
     "Mozilla/5.0 (Linux; Android 12; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36",
     "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
 ]
+
 
 def _yad2_api_headers() -> dict:
     return {
@@ -65,6 +65,7 @@ def _yad2_api_headers() -> dict:
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-site",
     }
+
 
 logger = logging.getLogger("checker")
 
@@ -80,13 +81,98 @@ def setup_logging() -> None:
     logging.basicConfig(level=logging.INFO, handlers=[handler, console])
 
 
+def _subdivide_boxes(boxes: list[tuple]) -> list[tuple]:
+    """Split each bBox into 4 sub-quadrants for finer map coverage."""
+    result = []
+    for lat_min, lon_min, lat_max, lon_max in boxes:
+        lat_mid = (lat_min + lat_max) / 2
+        lon_mid = (lon_min + lon_max) / 2
+        result.extend([
+            (lat_min, lon_min, lat_mid, lon_mid),
+            (lat_min, lon_mid, lat_mid, lon_max),
+            (lat_mid, lon_min, lat_max, lon_mid),
+            (lat_mid, lon_mid, lat_max, lon_max),
+        ])
+    return result
+
+
+async def _fetch_yad2_active_tokens() -> set[str]:
+    """
+    Call the Yad2 map API across 16 bBoxes (4x4 subdivision of Tel Aviv)
+    and return the set of all currently active listing tokens.
+
+    The map API is the same one the Sunday scanner uses — it works from
+    GitHub Actions without PerimeterX blocking.  Expired/removed listings
+    are stripped from search results, so any token absent from this set
+    is no longer being shown to renters.
+    """
+    boxes = _subdivide_boxes(TEL_AVIV_BOXES)
+    active_tokens: set[str] = set()
+    map_api_worked = False
+
+    async with aiohttp.ClientSession(headers=_yad2_api_headers()) as session:
+        for lat_min, lon_min, lat_max, lon_max in boxes:
+            bbox = f"{lat_min},{lon_min},{lat_max},{lon_max}"
+            params = {
+                "city": "5000",
+                "area": "1",
+                "region": "3",
+                "property": "1",
+                "bBox": bbox,
+                "zoom": "14",
+            }
+            try:
+                async with session.get(
+                    YAD2_MAP_URL, params=params, timeout=aiohttp.ClientTimeout(total=20),
+                    allow_redirects=False,
+                ) as resp:
+                    if resp.status in (301, 302, 303, 307, 308):
+                        logger.warning("Map API redirected (PerimeterX?) for bBox %s — skipping", bbox)
+                        continue
+                    if resp.status != 200:
+                        logger.warning("Map API HTTP %d for bBox %s — skipping", resp.status, bbox)
+                        continue
+                    data = await resp.json(content_type=None)
+                    markers: list = []
+                    if isinstance(data, dict):
+                        inner = data.get("data") or {}
+                        markers = inner.get("markers", []) if isinstance(inner, dict) else []
+                    elif isinstance(data, list):
+                        markers = data
+                    count_before = len(active_tokens)
+                    for m in markers:
+                        token = str(m.get("token") or m.get("id") or "")
+                        if token:
+                            active_tokens.add(token)
+                    new = len(active_tokens) - count_before
+                    logger.info("Map API bBox %s: %d markers, %d new tokens", bbox, len(markers), new)
+                    if markers:
+                        map_api_worked = True
+                    if len(markers) == 200:
+                        logger.warning(
+                            "bBox %s hit the 200-marker cap — some tokens may be missing; "
+                            "map check may produce false negatives for this area",
+                            bbox,
+                        )
+            except Exception as exc:
+                logger.warning("Map API error for bBox %s: %s", bbox, exc)
+
+            await asyncio.sleep(random.uniform(2, 3))
+
+    if map_api_worked:
+        logger.info("Yad2 map inventory complete: %d unique active tokens", len(active_tokens))
+    else:
+        logger.warning("Map API returned no data at all — map-based check disabled")
+    return active_tokens if map_api_worked else set()
+
+
 async def _check_yad2_gw(url: str) -> bool | None:
     """
-    Try the Yad2 GW API directly with the token extracted from the URL.
-    Returns True (inactive), False (active), or None (inconclusive/API error).
+    Try the Yad2 GW item API directly.
+    Returns True (inactive), False (active), or None (inconclusive).
 
-    The GW API is the same backend the React SPA calls — it returns real 404s
-    for deleted items, unlike www.yad2.co.il which always serves the React shell.
+    Fully-deleted listings return HTTP 404.
+    Expired listings that still exist in the DB return 302 (PerimeterX redirect).
     """
     token = url.rstrip("/").rsplit("/", 1)[-1]
     gw_url = f"https://gw.yad2.co.il/realestate-feed/rent/item/{token}"
@@ -95,13 +181,11 @@ async def _check_yad2_gw(url: str) -> bool | None:
             async with session.get(
                 gw_url, timeout=aiohttp.ClientTimeout(total=12), allow_redirects=False
             ) as resp:
-                logger.debug("Yad2 GW API %s → HTTP %d", gw_url, resp.status)
                 if resp.status == 404:
                     logger.info("Yad2 GW API 404 → inactive: %s", url)
                     return True
                 if resp.status in (301, 302, 303, 307, 308):
-                    # PerimeterX redirect — this IP is being challenged; inconclusive
-                    logger.debug("Yad2 GW API redirect (PerimeterX?) for %s — falling back", url)
+                    logger.info("Yad2 GW API redirect (PerimeterX) → inconclusive: %s", url)
                     return None
                 if resp.status == 200:
                     try:
@@ -111,27 +195,18 @@ async def _check_yad2_gw(url: str) -> bool | None:
                             if item_data is None:
                                 logger.info("Yad2 GW API null data → inactive: %s", url)
                                 return True
-                            # Log status/active fields so we can learn the schema
                             if isinstance(item_data, dict):
                                 status = item_data.get("status") or item_data.get("isActive") or item_data.get("is_active")
                                 ad_status = item_data.get("adStatus") or item_data.get("ad_status")
-                                logger.info(
-                                    "Yad2 GW API 200 for %s | status=%r adStatus=%r keys=%s",
-                                    url, status, ad_status,
-                                    list(item_data.keys())[:15],
-                                )
-                                # Treat known inactive status values as inactive
+                                logger.info("Yad2 GW API 200 — status=%r adStatus=%r: %s", status, ad_status, url)
                                 inactive_statuses = {"inactive", "expired", "deleted", "removed", "paused", "0", 0, False}
                                 if status in inactive_statuses or ad_status in inactive_statuses:
-                                    logger.info("Yad2 GW API status='%s' → inactive: %s", status or ad_status, url)
                                     return True
-                            return False  # data present, no inactive status found → active
+                            return False
                     except Exception:
                         pass
-                    # Got 200 but couldn't parse JSON → inconclusive
                     return None
-                # 403, 429, 5xx, etc. → inconclusive
-                logger.warning("Yad2 GW API unexpected status %d for %s", resp.status, url)
+                logger.warning("Yad2 GW API HTTP %d → inconclusive: %s", resp.status, url)
                 return None
     except Exception as exc:
         logger.debug("Yad2 GW API error for %s: %s", url, exc)
@@ -140,9 +215,8 @@ async def _check_yad2_gw(url: str) -> bool | None:
 
 async def _check_yad2_playwright(page, url: str) -> bool:
     """
-    Fallback: open the Yad2 item page in Playwright and intercept GW API responses.
-    When a listing is deleted, the React app calls gw.yad2.co.il which returns 404.
-    Also checks page text as a secondary signal.
+    Last-resort: open the Yad2 item page in Playwright, intercept GW API responses,
+    and check page text. Used when both GW API and map check are inconclusive.
     """
     gw_404 = False
 
@@ -150,7 +224,6 @@ async def _check_yad2_playwright(page, url: str) -> bool:
         nonlocal gw_404
         try:
             if "gw.yad2.co.il" in response.url and response.status == 404:
-                logger.debug("Intercepted GW 404 for %s", response.url)
                 gw_404 = True
         except Exception:
             pass
@@ -160,19 +233,15 @@ async def _check_yad2_playwright(page, url: str) -> bool:
         nav_resp = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
         if nav_resp and nav_resp.status in (404, 410):
             return True
-        # Give the React app 6 s to boot and make its API call
         await page.wait_for_timeout(6000)
-
         if gw_404:
             logger.info("Yad2 Playwright GW 404 intercept → inactive: %s", url)
             return True
-
-        # Secondary: check visible text for inactive patterns
         try:
             text = (await page.inner_text("body")).lower()
             for pattern in INACTIVE_PATTERNS:
                 if pattern.lower() in text:
-                    logger.info("Yad2 Playwright text pattern '%s' → inactive: %s", pattern, url)
+                    logger.info("Yad2 Playwright text '%s' → inactive: %s", pattern, url)
                     return True
         except Exception:
             pass
@@ -180,7 +249,6 @@ async def _check_yad2_playwright(page, url: str) -> bool:
         logger.warning("Yad2 Playwright check failed for %s: %s — keeping row", url, exc)
     finally:
         page.remove_listener("response", _on_response)
-
     return False
 
 
@@ -202,7 +270,6 @@ async def _check_browser(page, url: str) -> bool:
 
 
 def delete_rows_batch(ws: gspread.Worksheet, row_numbers: list[int]) -> None:
-    """Delete multiple rows in one Sheets API call (highest first to avoid index shift)."""
     requests = []
     for row_num in sorted(row_numbers, reverse=True):
         requests.append({
@@ -246,6 +313,10 @@ async def main() -> None:
     data_rows = all_values[1:]
     logger.info("Checking %d listings...", len(data_rows))
 
+    # Build the Yad2 active-token inventory ONCE before iterating rows.
+    # This tells us which listings still appear in search results.
+    yad2_active_tokens = await _fetch_yad2_active_tokens()
+
     rows_to_delete: list[int] = []
 
     async with async_playwright() as pw:
@@ -266,14 +337,24 @@ async def main() -> None:
                 continue
 
             if "yad2.co.il" in url:
-                # Step 1: try direct GW API (fast, no browser needed)
+                token = url.rstrip("/").rsplit("/", 1)[-1]
+
+                # Step 1: GW item API — catches fully-deleted listings (HTTP 404)
                 gw_result = await _check_yad2_gw(url)
-                if gw_result is not None:
-                    inactive = gw_result
+                if gw_result is True:
+                    inactive = True
+                elif gw_result is False:
+                    inactive = False
                 else:
-                    # Step 2: open page and intercept GW API responses
-                    logger.debug("GW API inconclusive for %s — trying Playwright", url)
-                    inactive = await _check_yad2_playwright(page, url)
+                    # Step 2: Map inventory — catches expired listings no longer in search
+                    if yad2_active_tokens:
+                        in_map = token in yad2_active_tokens
+                        inactive = not in_map
+                        reason = "not in map inventory" if inactive else "found in map inventory"
+                        logger.info("Yad2 map check — %s: %s", reason, url)
+                    else:
+                        # Step 3: Playwright fallback (map API also unavailable)
+                        inactive = await _check_yad2_playwright(page, url)
             else:
                 inactive = await _check_browser(page, url)
 
