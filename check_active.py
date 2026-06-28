@@ -1,8 +1,10 @@
 import asyncio
+import json
 import logging
 import os
 import random
 import sys
+from datetime import date
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -24,6 +26,7 @@ except ImportError:
 
 BASE_DIR = Path(__file__).parent
 LOG_PATH = BASE_DIR / "logs" / "checker.log"
+INCONCLUSIVE_FILE = BASE_DIR / "data" / "yad2_inconclusive.json"
 
 SCOPES = [
     "https://spreadsheets.google.com/feeds",
@@ -81,8 +84,40 @@ def setup_logging() -> None:
     logging.basicConfig(level=logging.INFO, handlers=[handler, console])
 
 
-def _subdivide_boxes(boxes: list[tuple]) -> list[tuple]:
-    """Split each bBox into 4 sub-quadrants for finer map coverage."""
+# ---------------------------------------------------------------------------
+# Inconclusive tracker — persisted in data/yad2_inconclusive.json
+# Format: { "token": {"count": N, "first_seen": "YYYY-MM-DD"} }
+# A token is deleted from the sheet after being inconclusive on 2 separate
+# calendar days.  This handles expired listings whose data Yad2 still keeps
+# in its DB (so the GW item API returns 302 instead of 404).
+# ---------------------------------------------------------------------------
+
+def _load_inconclusive() -> dict:
+    if INCONCLUSIVE_FILE.exists():
+        try:
+            return json.loads(INCONCLUSIVE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_inconclusive(data: dict) -> None:
+    INCONCLUSIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    INCONCLUSIVE_FILE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _inconclusive_is_stale(entry: dict, today: str) -> bool:
+    """Return True if this token has been inconclusive on a previous calendar day."""
+    return entry.get("first_seen", today) < today
+
+
+# ---------------------------------------------------------------------------
+# Yad2 map inventory (optional — works when PerimeterX doesn't block the runner)
+# ---------------------------------------------------------------------------
+
+def _subdivide_boxes(boxes: list) -> list:
     result = []
     for lat_min, lon_min, lat_max, lon_max in boxes:
         lat_mid = (lat_min + lat_max) / 2
@@ -97,15 +132,6 @@ def _subdivide_boxes(boxes: list[tuple]) -> list[tuple]:
 
 
 async def _fetch_yad2_active_tokens() -> set[str]:
-    """
-    Call the Yad2 map API across 16 bBoxes (4x4 subdivision of Tel Aviv)
-    and return the set of all currently active listing tokens.
-
-    The map API is the same one the Sunday scanner uses — it works from
-    GitHub Actions without PerimeterX blocking.  Expired/removed listings
-    are stripped from search results, so any token absent from this set
-    is no longer being shown to renters.
-    """
     boxes = _subdivide_boxes(TEL_AVIV_BOXES)
     active_tokens: set[str] = set()
     map_api_worked = False
@@ -113,18 +139,12 @@ async def _fetch_yad2_active_tokens() -> set[str]:
     async with aiohttp.ClientSession(headers=_yad2_api_headers()) as session:
         for lat_min, lon_min, lat_max, lon_max in boxes:
             bbox = f"{lat_min},{lon_min},{lat_max},{lon_max}"
-            params = {
-                "city": "5000",
-                "area": "1",
-                "region": "3",
-                "property": "1",
-                "bBox": bbox,
-                "zoom": "14",
-            }
+            params = {"city": "5000", "area": "1", "region": "3",
+                      "property": "1", "bBox": bbox, "zoom": "14"}
             try:
                 async with session.get(
-                    YAD2_MAP_URL, params=params, timeout=aiohttp.ClientTimeout(total=20),
-                    allow_redirects=False,
+                    YAD2_MAP_URL, params=params,
+                    timeout=aiohttp.ClientTimeout(total=20), allow_redirects=False,
                 ) as resp:
                     if resp.status in (301, 302, 303, 307, 308):
                         logger.warning("Map API redirected (PerimeterX?) for bBox %s — skipping", bbox)
@@ -144,35 +164,30 @@ async def _fetch_yad2_active_tokens() -> set[str]:
                         token = str(m.get("token") or m.get("id") or "")
                         if token:
                             active_tokens.add(token)
-                    new = len(active_tokens) - count_before
-                    logger.info("Map API bBox %s: %d markers, %d new tokens", bbox, len(markers), new)
+                    logger.info("Map API bBox %s: %d markers, %d new tokens",
+                                bbox, len(markers), len(active_tokens) - count_before)
                     if markers:
                         map_api_worked = True
-                    if len(markers) == 200:
-                        logger.warning(
-                            "bBox %s hit the 200-marker cap — some tokens may be missing; "
-                            "map check may produce false negatives for this area",
-                            bbox,
-                        )
             except Exception as exc:
                 logger.warning("Map API error for bBox %s: %s", bbox, exc)
-
             await asyncio.sleep(random.uniform(2, 3))
 
     if map_api_worked:
-        logger.info("Yad2 map inventory complete: %d unique active tokens", len(active_tokens))
+        logger.info("Yad2 map inventory: %d unique active tokens", len(active_tokens))
     else:
-        logger.warning("Map API returned no data at all — map-based check disabled")
+        logger.warning("Map API returned no data — map-based check disabled for this run")
     return active_tokens if map_api_worked else set()
 
 
+# ---------------------------------------------------------------------------
+# Per-listing checks
+# ---------------------------------------------------------------------------
+
 async def _check_yad2_gw(url: str) -> bool | None:
     """
-    Try the Yad2 GW item API directly.
-    Returns True (inactive), False (active), or None (inconclusive).
-
-    Fully-deleted listings return HTTP 404.
-    Expired listings that still exist in the DB return 302 (PerimeterX redirect).
+    Query the Yad2 GW item API.
+    Returns True (inactive), False (active), or None (inconclusive/PerimeterX).
+    Fully-deleted listings return 404.  Expired listings return 302.
     """
     token = url.rstrip("/").rsplit("/", 1)[-1]
     gw_url = f"https://gw.yad2.co.il/realestate-feed/rent/item/{token}"
@@ -196,11 +211,16 @@ async def _check_yad2_gw(url: str) -> bool | None:
                                 logger.info("Yad2 GW API null data → inactive: %s", url)
                                 return True
                             if isinstance(item_data, dict):
-                                status = item_data.get("status") or item_data.get("isActive") or item_data.get("is_active")
-                                ad_status = item_data.get("adStatus") or item_data.get("ad_status")
-                                logger.info("Yad2 GW API 200 — status=%r adStatus=%r: %s", status, ad_status, url)
-                                inactive_statuses = {"inactive", "expired", "deleted", "removed", "paused", "0", 0, False}
-                                if status in inactive_statuses or ad_status in inactive_statuses:
+                                status = (item_data.get("status") or
+                                          item_data.get("isActive") or
+                                          item_data.get("is_active"))
+                                ad_status = (item_data.get("adStatus") or
+                                             item_data.get("ad_status"))
+                                logger.info("Yad2 GW API 200 — status=%r adStatus=%r: %s",
+                                            status, ad_status, url)
+                                inactive_vals = {"inactive", "expired", "deleted",
+                                                 "removed", "paused", "0", 0, False}
+                                if status in inactive_vals or ad_status in inactive_vals:
                                     return True
                             return False
                     except Exception:
@@ -214,10 +234,7 @@ async def _check_yad2_gw(url: str) -> bool | None:
 
 
 async def _check_yad2_playwright(page, url: str) -> bool:
-    """
-    Last-resort: open the Yad2 item page in Playwright, intercept GW API responses,
-    and check page text. Used when both GW API and map check are inconclusive.
-    """
+    """Last-resort Playwright check with GW response interception."""
     gw_404 = False
 
     async def _on_response(response):
@@ -270,9 +287,9 @@ async def _check_browser(page, url: str) -> bool:
 
 
 def delete_rows_batch(ws: gspread.Worksheet, row_numbers: list[int]) -> None:
-    requests = []
+    requests_list = []
     for row_num in sorted(row_numbers, reverse=True):
-        requests.append({
+        requests_list.append({
             "deleteDimension": {
                 "range": {
                     "sheetId": ws.id,
@@ -282,7 +299,7 @@ def delete_rows_batch(ws: gspread.Worksheet, row_numbers: list[int]) -> None:
                 }
             }
         })
-    ws.spreadsheet.batch_update({"requests": requests})
+    ws.spreadsheet.batch_update({"requests": requests_list})
 
 
 async def main() -> None:
@@ -313,11 +330,14 @@ async def main() -> None:
     data_rows = all_values[1:]
     logger.info("Checking %d listings...", len(data_rows))
 
-    # Build the Yad2 active-token inventory ONCE before iterating rows.
-    # This tells us which listings still appear in search results.
+    today = date.today().isoformat()
+    inconclusive = _load_inconclusive()
+
+    # Try to build Yad2 map inventory (works when PerimeterX doesn't block)
     yad2_active_tokens = await _fetch_yad2_active_tokens()
 
     rows_to_delete: list[int] = []
+    tokens_still_inconclusive: set[str] = set()
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
@@ -339,22 +359,64 @@ async def main() -> None:
             if "yad2.co.il" in url:
                 token = url.rstrip("/").rsplit("/", 1)[-1]
 
-                # Step 1: GW item API — catches fully-deleted listings (HTTP 404)
+                # Step 1: GW item API — 404 = deleted for sure
                 gw_result = await _check_yad2_gw(url)
+
                 if gw_result is True:
                     inactive = True
+                    inconclusive.pop(token, None)  # clear tracking
+
                 elif gw_result is False:
                     inactive = False
+                    inconclusive.pop(token, None)  # confirmed active
+
                 else:
-                    # Step 2: Map inventory — catches expired listings no longer in search
+                    # GW returned 302 (PerimeterX) — inconclusive
+
+                    # Step 2: Map inventory (if available this run)
                     if yad2_active_tokens:
                         in_map = token in yad2_active_tokens
-                        inactive = not in_map
-                        reason = "not in map inventory" if inactive else "found in map inventory"
-                        logger.info("Yad2 map check — %s: %s", reason, url)
+                        if in_map:
+                            logger.info("Yad2 map: token found → active: %s", url)
+                            inactive = False
+                            inconclusive.pop(token, None)
+                        else:
+                            logger.info("Yad2 map: token absent → inactive: %s", url)
+                            inactive = True
+                            inconclusive.pop(token, None)
+
                     else:
-                        # Step 3: Playwright fallback (map API also unavailable)
-                        inactive = await _check_yad2_playwright(page, url)
+                        # Step 3: Inconclusive tracker
+                        entry = inconclusive.get(token)
+                        if entry and _inconclusive_is_stale(entry, today):
+                            # Seen as inconclusive on a previous day → expired
+                            logger.info(
+                                "Yad2 token %s inconclusive since %s (stale) → inactive: %s",
+                                token, entry["first_seen"], url,
+                            )
+                            inactive = True
+                            inconclusive.pop(token, None)
+                        else:
+                            # Step 4: Playwright last resort
+                            inactive = await _check_yad2_playwright(page, url)
+                            if inactive:
+                                inconclusive.pop(token, None)
+                            else:
+                                # Still inconclusive — record for next run
+                                if token not in inconclusive:
+                                    inconclusive[token] = {"count": 1, "first_seen": today}
+                                    logger.info(
+                                        "Yad2 token %s marked inconclusive (first time, date=%s) — keeping: %s",
+                                        token, today, url,
+                                    )
+                                else:
+                                    inconclusive[token]["count"] += 1
+                                    logger.info(
+                                        "Yad2 token %s still inconclusive (count=%d, first=%s) — keeping: %s",
+                                        token, inconclusive[token]["count"],
+                                        inconclusive[token]["first_seen"], url,
+                                    )
+                                tokens_still_inconclusive.add(token)
             else:
                 inactive = await _check_browser(page, url)
 
@@ -369,12 +431,31 @@ async def main() -> None:
         await context.close()
         await browser.close()
 
-    if not rows_to_delete:
-        logger.info("All %d listings are still active. Nothing deleted.", len(data_rows))
-    else:
+    # Remove inconclusive entries for tokens no longer in the sheet
+    sheet_tokens = set()
+    for row in data_rows:
+        url = row[url_col_idx] if url_col_idx < len(row) else ""
+        if "yad2.co.il" in url:
+            sheet_tokens.add(url.rstrip("/").rsplit("/", 1)[-1])
+    for token in list(inconclusive.keys()):
+        if token not in sheet_tokens:
+            inconclusive.pop(token, None)
+
+    _save_inconclusive(inconclusive)
+
+    if rows_to_delete:
         logger.info("Deleting %d inactive rows from sheet...", len(rows_to_delete))
         delete_rows_batch(ws, rows_to_delete)
         logger.info("Done. Deleted rows: %s", rows_to_delete)
+    else:
+        logger.info("All %d listings are still active. Nothing deleted.", len(data_rows))
+
+    if tokens_still_inconclusive:
+        logger.info(
+            "%d Yad2 tokens remain inconclusive (PerimeterX blocked all checks). "
+            "They will be deleted on the next run if still inconclusive: %s",
+            len(tokens_still_inconclusive), tokens_still_inconclusive,
+        )
 
     logger.info("=== Checker complete ===")
 

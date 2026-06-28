@@ -9,6 +9,8 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -45,3 +47,11 @@ jobs:
 
       - name: Run active listing checker
         run: python check_active.py
+
+      - name: Commit inconclusive tracker
+        run: |
+          git config user.name "Apartment Scanner Bot"
+          git config user.email "scanner-bot@users.noreply.github.com"
+          git add data/yad2_inconclusive.json
+          git diff --staged --quiet || git commit -m "chore: update Yad2 inconclusive tracker [skip ci]"
+          git push

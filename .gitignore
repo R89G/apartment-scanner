@@ -2,6 +2,7 @@
 google_credentials.json
 data/*
 !data/seen_listings.db
+!data/yad2_inconclusive.json
 logs/
 __pycache__/
 *.pyc
