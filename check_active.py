@@ -111,8 +111,21 @@ async def _check_yad2_gw(url: str) -> bool | None:
                             if item_data is None:
                                 logger.info("Yad2 GW API null data → inactive: %s", url)
                                 return True
-                            # data present → listing exists
-                            return False
+                            # Log status/active fields so we can learn the schema
+                            if isinstance(item_data, dict):
+                                status = item_data.get("status") or item_data.get("isActive") or item_data.get("is_active")
+                                ad_status = item_data.get("adStatus") or item_data.get("ad_status")
+                                logger.info(
+                                    "Yad2 GW API 200 for %s | status=%r adStatus=%r keys=%s",
+                                    url, status, ad_status,
+                                    list(item_data.keys())[:15],
+                                )
+                                # Treat known inactive status values as inactive
+                                inactive_statuses = {"inactive", "expired", "deleted", "removed", "paused", "0", 0, False}
+                                if status in inactive_statuses or ad_status in inactive_statuses:
+                                    logger.info("Yad2 GW API status='%s' → inactive: %s", status or ad_status, url)
+                                    return True
+                            return False  # data present, no inactive status found → active
                     except Exception:
                         pass
                     # Got 200 but couldn't parse JSON → inconclusive
