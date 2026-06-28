@@ -30,12 +30,12 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-# Text patterns that mean the listing is gone (checked against page text)
+# Text patterns that mean the listing is gone (checked against page body text)
 INACTIVE_PATTERNS = [
-    "חיפשנו בכל מקום",      # Yad2
-    "אין לנו עמוד כזה",      # Yad2
-    "מודעה לא פעילה",        # OnMap
-    "עמוד לא נמצא",          # Komo
+    "חיפשנו בכל מקום",
+    "אין לנו עמוד כזה",
+    "מודעה לא פעילה",
+    "עמוד לא נמצא",
     "המודעה הוסרה",
     "המודעה לא קיימת",
     "המודעה לא נמצאה",
@@ -45,14 +45,26 @@ INACTIVE_PATTERNS = [
     "listing removed",
 ]
 
-# Yad2 mobile headers — same as the scraper, bypasses PerimeterX
-_YAD2_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
-    "Referer": "https://www.yad2.co.il/realestate/rent",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-}
+# GW API headers — same style as yad2.py map API (these bypass PerimeterX)
+_MOBILE_UAS = [
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 12; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+]
+
+def _yad2_api_headers() -> dict:
+    return {
+        "User-Agent": random.choice(_MOBILE_UAS),
+        "Referer": "https://www.yad2.co.il/realestate/rent",
+        "Origin": "https://www.yad2.co.il",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-site",
+    }
 
 logger = logging.getLogger("checker")
 
@@ -68,33 +80,95 @@ def setup_logging() -> None:
     logging.basicConfig(level=logging.INFO, handlers=[handler, console])
 
 
-async def _check_yad2(url: str) -> bool:
+async def _check_yad2_gw(url: str) -> bool | None:
     """
-    Check a Yad2 listing using aiohttp (no browser).
-    PerimeterX is JavaScript-based and cannot block plain HTTP requests.
-    If the listing is gone the server returns HTTP 404 directly.
+    Try the Yad2 GW API directly with the token extracted from the URL.
+    Returns True (inactive), False (active), or None (inconclusive/API error).
+
+    The GW API is the same backend the React SPA calls — it returns real 404s
+    for deleted items, unlike www.yad2.co.il which always serves the React shell.
     """
+    token = url.rstrip("/").rsplit("/", 1)[-1]
+    gw_url = f"https://gw.yad2.co.il/realestate-feed/rent/item/{token}"
     try:
-        async with aiohttp.ClientSession(headers=_YAD2_HEADERS) as session:
+        async with aiohttp.ClientSession(headers=_yad2_api_headers()) as session:
             async with session.get(
-                url,
-                timeout=aiohttp.ClientTimeout(total=15),
-                allow_redirects=True,
+                gw_url, timeout=aiohttp.ClientTimeout(total=12), allow_redirects=False
             ) as resp:
+                logger.debug("Yad2 GW API %s → HTTP %d", gw_url, resp.status)
                 if resp.status == 404:
-                    logger.info("Yad2 HTTP 404 → inactive: %s", url)
+                    logger.info("Yad2 GW API 404 → inactive: %s", url)
                     return True
+                if resp.status in (301, 302, 303, 307, 308):
+                    # PerimeterX redirect — this IP is being challenged; inconclusive
+                    logger.debug("Yad2 GW API redirect (PerimeterX?) for %s — falling back", url)
+                    return None
                 if resp.status == 200:
-                    # Also scan the SSR HTML for inline inactive signals
-                    html = await resp.text(errors="ignore")
-                    for pattern in INACTIVE_PATTERNS:
-                        if pattern in html:
-                            logger.info("Yad2 SSR pattern '%s' → inactive: %s", pattern, url)
-                            return True
-                    return False
+                    try:
+                        data = await resp.json(content_type=None)
+                        if isinstance(data, dict):
+                            item_data = data.get("data")
+                            if item_data is None:
+                                logger.info("Yad2 GW API null data → inactive: %s", url)
+                                return True
+                            # data present → listing exists
+                            return False
+                    except Exception:
+                        pass
+                    # Got 200 but couldn't parse JSON → inconclusive
+                    return None
+                # 403, 429, 5xx, etc. → inconclusive
+                logger.warning("Yad2 GW API unexpected status %d for %s", resp.status, url)
+                return None
     except Exception as exc:
-        logger.warning("Yad2 HTTP check failed for %s: %s — keeping row", url, exc)
-    return False  # safe default
+        logger.debug("Yad2 GW API error for %s: %s", url, exc)
+        return None
+
+
+async def _check_yad2_playwright(page, url: str) -> bool:
+    """
+    Fallback: open the Yad2 item page in Playwright and intercept GW API responses.
+    When a listing is deleted, the React app calls gw.yad2.co.il which returns 404.
+    Also checks page text as a secondary signal.
+    """
+    gw_404 = False
+
+    async def _on_response(response):
+        nonlocal gw_404
+        try:
+            if "gw.yad2.co.il" in response.url and response.status == 404:
+                logger.debug("Intercepted GW 404 for %s", response.url)
+                gw_404 = True
+        except Exception:
+            pass
+
+    page.on("response", _on_response)
+    try:
+        nav_resp = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        if nav_resp and nav_resp.status in (404, 410):
+            return True
+        # Give the React app 6 s to boot and make its API call
+        await page.wait_for_timeout(6000)
+
+        if gw_404:
+            logger.info("Yad2 Playwright GW 404 intercept → inactive: %s", url)
+            return True
+
+        # Secondary: check visible text for inactive patterns
+        try:
+            text = (await page.inner_text("body")).lower()
+            for pattern in INACTIVE_PATTERNS:
+                if pattern.lower() in text:
+                    logger.info("Yad2 Playwright text pattern '%s' → inactive: %s", pattern, url)
+                    return True
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.warning("Yad2 Playwright check failed for %s: %s — keeping row", url, exc)
+    finally:
+        page.remove_listener("response", _on_response)
+
+    return False
 
 
 async def _check_browser(page, url: str) -> bool:
@@ -179,7 +253,14 @@ async def main() -> None:
                 continue
 
             if "yad2.co.il" in url:
-                inactive = await _check_yad2(url)
+                # Step 1: try direct GW API (fast, no browser needed)
+                gw_result = await _check_yad2_gw(url)
+                if gw_result is not None:
+                    inactive = gw_result
+                else:
+                    # Step 2: open page and intercept GW API responses
+                    logger.debug("GW API inconclusive for %s — trying Playwright", url)
+                    inactive = await _check_yad2_playwright(page, url)
             else:
                 inactive = await _check_browser(page, url)
 
