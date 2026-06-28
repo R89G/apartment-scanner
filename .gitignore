@@ -1,0 +1,16 @@
+.env
+google_credentials.json
+data/*
+!data/seen_listings.db
+logs/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+discovered_sites.json
+last_run.json

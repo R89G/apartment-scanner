@@ -1,0 +1,61 @@
+{
+  "address": {
+    "region": {
+      "text": "תל אביב והסביבה",
+      "id": 3
+    },
+    "city": {
+      "text": "תל אביב יפו"
+    },
+    "area": {
+      "text": "אזור תל אביב יפו"
+    },
+    "neighborhood": {
+      "text": "רמת אביב ג'"
+    },
+    "street": {
+      "text": "אליהו בית צורי"
+    },
+    "house": {
+      "number": 12,
+      "floor": 1
+    },
+    "coords": {
+      "lon": 34.799197,
+      "lat": 32.122456
+    }
+  },
+  "subcategoryId": 2,
+  "categoryId": 2,
+  "adType": "private",
+  "price": 12000,
+  "token": "bqsyuc7l",
+  "additionalDetails": {
+    "property": {
+      "text": "דירה"
+    },
+    "roomsCount": 4,
+    "squareMeter": 120,
+    "propertyCondition": {
+      "id": 2
+    }
+  },
+  "metaData": {
+    "coverImage": "https://img.yad2.co.il/Pic/202605/11/2_2/o/y2_1_06116_20260511063854.jpeg",
+    "images": [
+      "https://img.yad2.co.il/Pic/202605/11/2_2/o/y2_1_06116_20260511063854.jpeg",
+      "https://img.yad2.co.il/Pic/202605/11/2_2/o/y2_2_04397_20260511063904.jpeg",
+      "https://img.yad2.co.il/Pic/202605/11/2_2/o/y2_3_07232_20260511063913.jpeg",
+      "https://img.yad2.co.il/Pic/202605/11/2_2/o/y2_4_03679_20260511063926.jpeg",
+      "https://img.yad2.co.il/Pic/202605/22/2_2/o/y2_5_01393_20260522105654.jpeg",
+      "https://img.yad2.co.il/Pic/202605/22/2_2/o/y2_6_09911_20260522105713.jpeg",
+      "https://img.yad2.co.il/Pic/202605/22/2_2/o/y2_7_02409_20260522105731.jpeg",
+      "https://img.yad2.co.il/Pic/202605/22/2_2/o/y2_8_09281_20260522105747.jpeg",
+      "https://img.yad2.co.il/Pic/202605/22/2_2/o/y2_9_03643_20260522105801.jpeg",
+      "https://img.yad2.co.il/Pic/202605/22/2_2/o/y2_10_02331_20260522105815.jpeg"
+    ],
+    "squareMeterBuild": 120
+  },
+  "orderId": 49352852,
+  "priority": 1
+}

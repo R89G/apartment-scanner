@@ -1,0 +1,79 @@
+{
+  "address": {
+    "region": {
+      "text": "תל אביב והסביבה",
+      "id": 3
+    },
+    "city": {
+      "text": "תל אביב יפו"
+    },
+    "area": {
+      "text": "אזור תל אביב יפו"
+    },
+    "neighborhood": {
+      "text": "פלורנטין"
+    },
+    "street": {
+      "text": "בנבנישתי"
+    },
+    "house": {
+      "number": 3,
+      "floor": 3
+    },
+    "coords": {
+      "lon": 34.769036,
+      "lat": 32.055976
+    }
+  },
+  "subcategoryId": 2,
+  "categoryId": 2,
+  "adType": "private",
+  "price": 5000,
+  "token": "rtqihgzw",
+  "additionalDetails": {
+    "property": {
+      "text": "דירה"
+    },
+    "roomsCount": 1.5,
+    "squareMeter": 50,
+    "propertyCondition": {
+      "id": 2
+    }
+  },
+  "metaData": {
+    "coverImage": "https://img.yad2.co.il/Pic/202605/14/2_2/o/y2_1pa_010472_20260514074225.jpeg",
+    "images": [
+      "https://img.yad2.co.il/Pic/202605/14/2_2/o/y2_1pa_010472_20260514074225.jpeg",
+      "https://img.yad2.co.il/Pic/202605/14/2_2/o/y2_1pa_010942_20260514074225.jpeg",
+      "https://img.yad2.co.il/Pic/202605/14/2_2/o/y2_1pa_010768_20260514074225.jpeg",
+      "https://img.yad2.co.il/Pic/202605/14/2_2/o/y2_1pa_010756_20260514074225.jpeg",
+      "https://img.yad2.co.il/Pic/202605/14/2_2/o/y2_1pa_010272_20260514074226.jpeg",
+      "https://img.yad2.co.il/Pic/202605/14/2_2/o/y2_1pa_010329_20260514074226.jpeg",
+      "https://img.yad2.co.il/Pic/202605/21/2_2/o/y2_7_06493_20260521081745.jpeg",
+      "https://img.yad2.co.il/Pic/202605/21/2_2/o/y2_8_01440_20260521081751.jpeg",
+      "https://img.yad2.co.il/Pic/202605/21/2_2/o/y2_9_04607_20260521081756.jpeg",
+      "https://img.yad2.co.il/Pic/202605/21/2_2/o/y2_10_07958_20260521081801.jpeg"
+    ],
+    "video": "//yad2.cdnwiz.com/p/102/sp/10200/playManifest/entryId/0_rpe5xvyy/format/url/protocol/http",
+    "squareMeterBuild": 45
+  },
+  "tags": [
+    {
+      "name": "נוף פתוח לפארק",
+      "id": 1005,
+      "priority": 1
+    },
+    {
+      "name": "מטבח גדול",
+      "id": 1020,
+      "priority": 3
+    },
+    {
+      "name": "בהזדמנות",
+      "id": 1091,
+      "priority": 10
+    }
+  ],
+  "orderId": 56941624,
+  "priority": 3
+}

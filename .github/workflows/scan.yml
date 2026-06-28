@@ -1,0 +1,60 @@
+name: Weekly Apartment Scan
+
+on:
+  schedule:
+    # Sunday at 06:00 UTC = 08:00 Israel winter time / 09:00 Israel summer time
+    - cron: '0 6 * * 0'
+  workflow_dispatch:  # allow manual trigger from GitHub UI
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    permissions:
+      contents: write  # needed to commit the updated dedup DB back to the repo
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: apartment-scanner/requirements.txt
+
+      - name: Install Python dependencies
+        run: pip install -r apartment-scanner/requirements.txt
+
+      - name: Install Playwright browsers
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Write .env file
+        run: |
+          cat > apartment-scanner/.env <<EOF
+          GMAIL_USER=${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD=${{ secrets.GMAIL_APP_PASSWORD }}
+          GOOGLE_CREDENTIALS_PATH=./google_credentials.json
+          GOOGLE_SHEET_NAME=${{ secrets.GOOGLE_SHEET_NAME }}
+          RECIPIENT_EMAIL=${{ secrets.RECIPIENT_EMAIL }}
+          EOF
+
+      - name: Write Google credentials file
+        run: echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > apartment-scanner/google_credentials.json
+
+      - name: Run apartment scanner
+        run: |
+          cd apartment-scanner
+          python main.py
+
+      - name: Commit updated dedup database
+        run: |
+          git config user.name "Apartment Scanner Bot"
+          git config user.email "scanner-bot@users.noreply.github.com"
+          git add apartment-scanner/data/seen_listings.db
+          git diff --staged --quiet || git commit -m "chore: update seen listings DB [skip ci]"
+          git push
