@@ -1,0 +1,47 @@
+name: Weekly Active Listing Check
+
+on:
+  schedule:
+    - cron: '0 6 * * 6'
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browser
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Write .env file
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          GOOGLE_SHEET_NAME: ${{ secrets.GOOGLE_SHEET_NAME }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        run: |
+          printf "GMAIL_USER=%s\n" "$GMAIL_USER" >> .env
+          printf "GMAIL_APP_PASSWORD=%s\n" "$GMAIL_APP_PASSWORD" >> .env
+          printf "GOOGLE_CREDENTIALS_PATH=./google_credentials.json\n" >> .env
+          printf "GOOGLE_SHEET_NAME=%s\n" "$GOOGLE_SHEET_NAME" >> .env
+          printf "RECIPIENT_EMAIL=%s\n" "$RECIPIENT_EMAIL" >> .env
+
+      - name: Write Google credentials file
+        run: echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > google_credentials.json
+
+      - name: Run active listing checker
+        run: python check_active.py
