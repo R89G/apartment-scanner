@@ -12,6 +12,14 @@ from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from playwright.async_api import async_playwright
 
+try:
+    from playwright_stealth import Stealth as _StealthCls
+    _stealth = _StealthCls()
+    HAS_STEALTH = True
+except ImportError:
+    _stealth = None
+    HAS_STEALTH = False
+
 BASE_DIR = Path(__file__).parent
 LOG_PATH = BASE_DIR / "logs" / "checker.log"
 
@@ -52,6 +60,7 @@ def setup_logging() -> None:
 
 async def is_inactive(page, url: str) -> bool:
     """Visit a listing URL and return True if the listing is no longer active."""
+    is_yad2 = "yad2.co.il" in url
     try:
         resp = await page.goto(url, wait_until="domcontentloaded", timeout=25000)
 
@@ -59,8 +68,9 @@ async def is_inactive(page, url: str) -> bool:
         if resp and resp.status in (404, 410):
             return True
 
-        # Wait for JS to render (needed for OnMap overlay etc.)
-        await page.wait_for_timeout(2500)
+        # Yad2 is a React SPA with anti-bot protection — needs longer to render
+        wait_ms = 5000 if is_yad2 else 2500
+        await page.wait_for_timeout(wait_ms)
 
         text = (await page.inner_text("body")).lower()
         for pattern in INACTIVE_PATTERNS:
@@ -129,6 +139,8 @@ async def main() -> None:
             viewport={"width": 1280, "height": 800},
         )
         page = await context.new_page()
+        if HAS_STEALTH:
+            await _stealth.apply_stealth_async(page)
 
         for i, row in enumerate(data_rows):
             sheet_row_num = i + 2  # 1-based + skip header row
