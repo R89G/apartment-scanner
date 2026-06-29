@@ -81,10 +81,6 @@ def setup_logging() -> None:
     logging.basicConfig(level=logging.INFO, handlers=[handler, console])
 
 
-# ---------------------------------------------------------------------------
-# Yad2 map inventory (optional — works when PerimeterX doesn't block the runner)
-# ---------------------------------------------------------------------------
-
 def _subdivide_boxes(boxes: list) -> list:
     result = []
     for lat_min, lon_min, lat_max, lon_max in boxes:
@@ -100,6 +96,12 @@ def _subdivide_boxes(boxes: list) -> list:
 
 
 async def _fetch_yad2_active_tokens() -> set[str]:
+    """
+    Fetch all currently active Yad2 tokens from the map API (16 bBoxes).
+    Returns an empty set if the map API is blocked by PerimeterX this run.
+    When the map API works, a token absent from the results is no longer
+    being shown to renters (expired or removed from search).
+    """
     boxes = _subdivide_boxes(TEL_AVIV_BOXES)
     active_tokens: set[str] = set()
     map_api_worked = False
@@ -143,66 +145,15 @@ async def _fetch_yad2_active_tokens() -> set[str]:
     if map_api_worked:
         logger.info("Yad2 map inventory: %d unique active tokens", len(active_tokens))
     else:
-        logger.warning("Map API returned no data — map-based check disabled for this run")
+        logger.warning("Map API returned no data — Yad2 rows will be kept as-is this run")
     return active_tokens if map_api_worked else set()
 
 
-# ---------------------------------------------------------------------------
-# Per-listing checks
-# ---------------------------------------------------------------------------
-
-async def _check_yad2_gw(url: str) -> bool | None:
-    """
-    Query the Yad2 GW item API.
-    Returns True (inactive), False (active), or None (inconclusive/PerimeterX).
-    Fully-deleted listings return 404.  Expired listings return 302.
-    """
-    token = url.rstrip("/").rsplit("/", 1)[-1]
-    gw_url = f"https://gw.yad2.co.il/realestate-feed/rent/item/{token}"
-    try:
-        async with aiohttp.ClientSession(headers=_yad2_api_headers()) as session:
-            async with session.get(
-                gw_url, timeout=aiohttp.ClientTimeout(total=12), allow_redirects=False
-            ) as resp:
-                if resp.status == 404:
-                    logger.info("Yad2 GW API 404 → inactive: %s", url)
-                    return True
-                if resp.status in (301, 302, 303, 307, 308):
-                    logger.info("Yad2 GW API redirect (PerimeterX) → inconclusive: %s", url)
-                    return None
-                if resp.status == 200:
-                    try:
-                        data = await resp.json(content_type=None)
-                        if isinstance(data, dict):
-                            item_data = data.get("data")
-                            if item_data is None:
-                                logger.info("Yad2 GW API null data → inactive: %s", url)
-                                return True
-                            if isinstance(item_data, dict):
-                                status = (item_data.get("status") or
-                                          item_data.get("isActive") or
-                                          item_data.get("is_active"))
-                                ad_status = (item_data.get("adStatus") or
-                                             item_data.get("ad_status"))
-                                logger.info("Yad2 GW API 200 — status=%r adStatus=%r: %s",
-                                            status, ad_status, url)
-                                inactive_vals = {"inactive", "expired", "deleted",
-                                                 "removed", "paused", "0", 0, False}
-                                if status in inactive_vals or ad_status in inactive_vals:
-                                    return True
-                            return False
-                    except Exception:
-                        pass
-                    return None
-                logger.warning("Yad2 GW API HTTP %d → inconclusive: %s", resp.status, url)
-                return None
-    except Exception as exc:
-        logger.debug("Yad2 GW API error for %s: %s", url, exc)
-        return None
-
-
 async def _check_yad2_playwright(page, url: str) -> bool:
-    """Last-resort Playwright check with GW response interception."""
+    """
+    Open the Yad2 item page in Playwright and intercept GW API responses.
+    Only used as a last resort when the map API is unavailable.
+    """
     gw_404 = False
 
     async def _on_response(response):
@@ -298,11 +249,12 @@ async def main() -> None:
     data_rows = all_values[1:]
     logger.info("Checking %d listings...", len(data_rows))
 
-    # Try to build Yad2 map inventory (works when PerimeterX doesn't block)
+    # Try to build Yad2 map inventory.
+    # When available this is the only signal used for Yad2 rows.
+    # When blocked by PerimeterX all Yad2 rows are kept (safe default).
     yad2_active_tokens = await _fetch_yad2_active_tokens()
 
     rows_to_delete: list[int] = []
-    inconclusive_count = 0
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
@@ -324,38 +276,19 @@ async def main() -> None:
             if "yad2.co.il" in url:
                 token = url.rstrip("/").rsplit("/", 1)[-1]
 
-                # Step 1: GW item API — 404 = deleted for sure
-                gw_result = await _check_yad2_gw(url)
-
-                if gw_result is True:
-                    inactive = True
-
-                elif gw_result is False:
-                    inactive = False
-
-                else:
-                    # GW returned 302 (PerimeterX blocked) — inconclusive
-
-                    # Step 2: Map inventory (when the map API isn't blocked)
-                    if yad2_active_tokens:
-                        in_map = token in yad2_active_tokens
-                        if in_map:
-                            logger.info("Yad2 map: token found → active: %s", url)
-                            inactive = False
-                        else:
-                            logger.info("Yad2 map: token absent from search results → inactive: %s", url)
-                            inactive = True
-
+                if yad2_active_tokens:
+                    # Map inventory available: token absent = no longer in search results
+                    if token in yad2_active_tokens:
+                        logger.info("Yad2 map: token found → active: %s", url)
+                        inactive = False
                     else:
-                        # Step 3: Playwright last resort
-                        inactive = await _check_yad2_playwright(page, url)
-                        if not inactive:
-                            # Both GW and map blocked — genuinely can't determine
-                            inconclusive_count += 1
-                            logger.info(
-                                "Yad2 token %s: all checks inconclusive (PerimeterX) — keeping: %s",
-                                token, url,
-                            )
+                        logger.info("Yad2 map: token absent from search results → inactive: %s", url)
+                        inactive = True
+                else:
+                    # Map blocked this run — use Playwright as last resort, otherwise keep
+                    inactive = await _check_yad2_playwright(page, url)
+                    if not inactive:
+                        logger.info("Yad2 map unavailable, Playwright inconclusive — keeping: %s", url)
             else:
                 inactive = await _check_browser(page, url)
 
@@ -375,15 +308,7 @@ async def main() -> None:
         delete_rows_batch(ws, rows_to_delete)
         logger.info("Done. Deleted rows: %s", rows_to_delete)
     else:
-        logger.info("All %d listings are still active. Nothing deleted.", len(data_rows))
-
-    if inconclusive_count:
-        logger.info(
-            "%d Yad2 listing(s) could not be verified (PerimeterX blocked GW API and map API). "
-            "They are kept in the sheet until Yad2 purges them (returns 404) "
-            "or until the map API is accessible again.",
-            inconclusive_count,
-        )
+        logger.info("No inactive listings found. Nothing deleted.")
 
     logger.info("=== Checker complete ===")
 
